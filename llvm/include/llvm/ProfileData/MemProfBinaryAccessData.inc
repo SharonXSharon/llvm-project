@@ -1,17 +1,10 @@
-*= == --MemProfBinaryAccessData.inc -
-          MemProf profiling runtime macros - *-C++ - * -= == == ==
-    = * | * | *Part of the LLVM Project,
-    under the Apache License v2 .0 with LLVM Exceptions.|
-            *See https : // llvm.org/LICENSE.txt for license information.
-                         | *SPDX - License -
-                               Identifier
-    : Apache -
-      2.0 WITH LLVM -
-      exception | *
-\*=
-    ==
-    -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- ==
-    = * /
+/*=-- MemProfBinaryAccessData.inc - MemProf profiling runtime macros -*- C++ -*-=*\
+|*
+|* Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+|* See https://llvm.org/LICENSE.txt for license information.
+|* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+|*
+\*===----------------------------------------------------------------------===*/
 /*
  * This file defines the macros for memprof profiling data structures
  * for binary access.
@@ -34,14 +27,14 @@
 // The version number of the raw binary format.
 #define MEMPROF_BINARY_ACCESS_RAW_VERSION 1ULL
 
-      // A struct describing the header used for the raw binary memprof profile
-      // format.
-      PACKED(struct BinaryAccessHeader {
-        uint64_t Magic;
-        uint64_t Version;
-        uint64_t TotalSize;
-        uint64_t SegmentOffset;
-        uint64_t NumSegments;
-        uint64_t MemAddressOffset;
-        uint64_t NumMemBlockAddresses;
-      });
+// A struct describing the header used for the raw binary memprof profile
+// format.
+PACKED(struct BinaryAccessHeader {
+  uint64_t Magic;
+  uint64_t Version;
+  uint64_t TotalSize;
+  uint64_t SegmentOffset;
+  uint64_t NumSegments;
+  uint64_t MemAddressOffset;
+  uint64_t NumMemBlockAddresses;
+});
