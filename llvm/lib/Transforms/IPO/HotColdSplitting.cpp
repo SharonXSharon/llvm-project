@@ -61,6 +61,8 @@
 
 STATISTIC(NumColdRegionsFound, "Number of cold regions found.");
 STATISTIC(NumColdRegionsOutlined, "Number of cold regions outlined.");
+STATISTIC(NumSwiftOnceSkipped,
+          "Number of Swift once-initialization functions skipped.");
 
 using namespace llvm;
 
@@ -87,12 +89,103 @@ static cl::opt<int> MaxParametersForSplit(
     "hotcoldsplit-max-params", cl::init(4), cl::Hidden,
     cl::desc("Maximum number of parameters for a split function"));
 
-static cl::opt<int> ColdBranchProbDenom(
-    "hotcoldsplit-cold-probability-denom", cl::init(100), cl::Hidden,
-    cl::desc("Divisor of cold branch probability."
-             "BranchProbability = 1/ColdBranchProbDenom"));
+static cl::opt<int>
+    ColdBranchProbDenom("hotcoldsplit-cold-probability-denom", cl::init(100),
+                        cl::Hidden,
+                        cl::desc("Divisor of cold branch probability."
+                                 "BranchProbability = 1/ColdBranchProbDenom"));
 
 namespace {
+
+//===----------------------------------------------------------------------===//
+// Swift Once-Initialization Protection
+//===----------------------------------------------------------------------===//
+//
+// Swift uses atomic once-tokens for thread-safe lazy initialization of static
+// variables. The pattern looks like:
+//
+//   if (once_token == initialized) {
+//     return cached_value;      // hot path
+//   }
+//   swift_once(&token, init);   // cold path - only executed once
+//   return cached_value;
+//
+// Hot/Cold Splitting can break this pattern by extracting the cold path into
+// a separate function, which corrupts the atomicity guarantees.
+//
+// Two levels of protection/detection is needed:
+//
+// 1. FUNCTION-LEVEL (isSwiftOnceWrapper):
+//    Detects Swift once-wrapper functions by their mangled name (_WZ suffix),
+//    works even if swift_once was inlined
+//
+// 2. BLOCK-LEVEL (containsSwiftOnceCall):
+//    - Detects blocks containing swift_once/dispatch_once calls and skip
+//    splitting
+//    - Safety net for:
+//      a) Objective-C code using dispatch_once
+//      b) Swift code manually calling swift_once outside _WZ functions
+//      c) Any other atomic initialization patterns
+//
+//===----------------------------------------------------------------------===//
+
+bool isSwiftOnceWrapper(const Function &F) {
+  StringRef Name = F.getName();
+
+  // Check for Swift mangled names:
+  // Swift 4.2: $S, _$S
+  // Swift 5+: $s, _$s
+  // Embedded Swift: $e, _$e
+  // Old style: _TtC, _TtGC, _TtP
+  bool IsSwiftMangled = Name.starts_with("_$s") || Name.starts_with("$s") ||
+                        Name.starts_with("_$S") || Name.starts_with("$S") ||
+                        Name.starts_with("_$e") || Name.starts_with("$e") ||
+                        Name.starts_with("_TtC") || Name.starts_with("_TtGC") ||
+                        Name.starts_with("_TtP");
+
+  if (!IsSwiftMangled)
+    return false;
+
+  // Check for once-wrapper patterns in Swift mangled names:
+  // _WZ: one-time initialization function (once wrapper)
+  // _Wz: one-time initialization helper
+  // These may be followed by LLVM suffixes like ".llvm.123456" or ".Tgm"
+  if (Name.ends_with("_WZ") || Name.ends_with("_Wz"))
+    return true;
+
+  // Check for _WZ or _Wz followed by a dot (LLVM suffix)
+  if (Name.contains("_WZ.") || Name.contains("_Wz."))
+    return true;
+
+  // Also check for type metadata accessor patterns that use once tokens
+  // These have patterns like "Ma" (metadata accessor) in the mangled name
+  // and internally call swift_once
+  if (Name.contains("Ma") && Name.contains("_T"))
+    return true;
+
+  return false;
+}
+
+/// Check if a basic block contains a call to swift_once or similar
+/// atomic initialization functions that should not be split.
+bool containsSwiftOnceCall(const BasicBlock &BB) {
+  for (const Instruction &I : BB) {
+    if (auto *CB = dyn_cast<CallBase>(&I)) {
+      if (Function *Callee = CB->getCalledFunction()) {
+        StringRef Name = Callee->getName();
+        // swift_once: Swift's once-initialization runtime function
+        // dispatch_once: libdispatch once function (also used by Swift)
+        // dispatch_once_f: function pointer variant
+        if (Name == "swift_once" || Name == "dispatch_once" ||
+            Name == "dispatch_once_f" || Name == "_dispatch_once" ||
+            Name == "_swift_once")
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Same as blockEndsInUnreachable in CodeGen/BranchFolding.cpp. Do not modify
 // this function unless you modify the MBB version as well.
 //
@@ -108,8 +201,7 @@ bool blockEndsInUnreachable(const BasicBlock &BB) {
   return !(isa<ReturnInst>(I) || isa<IndirectBrInst>(I));
 }
 
-void analyzeProfMetadata(BasicBlock *BB,
-                         BranchProbability ColdProbThresh,
+void analyzeProfMetadata(BasicBlock *BB, BranchProbability ColdProbThresh,
                          SmallPtrSetImpl<BasicBlock *> &AnnotatedColdBlocks) {
   // TODO: Handle branches with > 2 successors.
   BranchInst *CondBr = dyn_cast<BranchInst>(BB->getTerminator());
@@ -185,6 +277,13 @@ static bool mayExtractBlock(const BasicBlock &BB) {
     return false;
   }
 
+  // Do not extract blocks containing swift_once or dispatch_once calls.
+  if (containsSwiftOnceCall(BB)) {
+    LLVM_DEBUG(dbgs() << "Block contains swift_once/dispatch_once call, "
+                      << "not extracting\n");
+    return false;
+  }
+
   return true;
 }
 
@@ -237,7 +336,8 @@ bool HotColdSplitting::isBasicBlockCold(
     if (PSI->isColdBlock(BB, BFI))
       return true;
   } else {
-    // Find cold blocks of successors of BB during a reverse postorder traversal.
+    // Find cold blocks of successors of BB during a reverse postorder
+    // traversal.
     analyzeProfMetadata(BB, ColdProbThresh, AnnotatedColdBlocks);
 
     // A statically cold BB would be known before it is visited
@@ -276,6 +376,14 @@ bool HotColdSplitting::shouldOutlineFrom(const Function &F) const {
   if (F.hasPersonalityFn())
     if (isScopedEHPersonality(classifyEHPersonality(F.getPersonalityFn())))
       return false;
+
+  // Do not outline Swift once-initialization wrapper functions.
+  if (isSwiftOnceWrapper(F)) {
+    LLVM_DEBUG(dbgs() << "Skipping Swift once-wrapper function: " << F.getName()
+                      << "\n");
+    ++NumSwiftOnceSkipped;
+    return false;
+  }
 
   return true;
 }
@@ -802,8 +910,8 @@ bool HotColdSplitting::run(Module &M) {
   return Changed;
 }
 
-PreservedAnalyses
-HotColdSplittingPass::run(Module &M, ModuleAnalysisManager &AM) {
+PreservedAnalyses HotColdSplittingPass::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
   auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
   auto LookupAC = [&FAM](Function &F) -> AssumptionCache * {
